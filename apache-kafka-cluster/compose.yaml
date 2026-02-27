@@ -1,0 +1,297 @@
+---
+# ============================================================
+# Simple Kafka — 3 Brokers, KRaft (no ZooKeeper)
+# Services: broker, broker2, broker3, kafka-connect, kafka-ui, topic-acl-init
+#
+# Key fixes in this version:
+#  ✔ NO custom entrypoint — apache/kafka handles storage format
+#    automatically when CLUSTER_ID env var is set (confirmed from
+#    official docs: hub.docker.com/r/apache/kafka)
+#  ✔ Healthcheck uses /bin/bash -c with TCP /dev/tcp (built into
+#    bash, no nc/netcat needed — avoids tool availability issues)
+#  ✔ All env values on single lines — no YAML block scalars
+#  ✔ INTERNAL:PLAINTEXT listener for inter-broker/healthcheck
+#    (avoids SASL bootstrap deadlock on combined mode startup)
+# ============================================================
+
+
+networks:
+  kafka-net:
+    driver: bridge
+
+volumes:
+  broker-data:
+  broker2-data:
+  broker3-data:
+  connect-plugins:
+
+# ─────────────────────────────────────────────────────────────
+# YAML anchor — env vars shared by every Kafka broker node
+# ─────────────────────────────────────────────────────────────
+x-kafka-broker-common-env: &kafka-broker-common-env
+  # ── KRaft (shared) ────────────────────────────────────────
+  CLUSTER_ID: "Mv8BNopRQfCqPGHGLsePMw"
+  KAFKA_CONTROLLER_QUORUM_VOTERS: "1@broker:9093"
+  KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+  KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CLIENT:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:SASL_PLAINTEXT"
+
+  # ── SASL ──────────────────────────────────────────────────
+  KAFKA_SASL_ENABLED_MECHANISMS: "PLAIN"
+  KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: "PLAIN"
+  KAFKA_OPTS: "-Djava.security.auth.login.config=/etc/kafka/secrets/kafka_server_jaas.conf"
+
+  # ── ACL / RBAC ────────────────────────────────────────────
+  KAFKA_AUTHORIZER_CLASS_NAME: "org.apache.kafka.metadata.authorizer.StandardAuthorizer"
+  KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
+  KAFKA_SUPER_USERS: "User:admin;User:ANONYMOUS"
+  KAFKA_AUTHORIZER_CLASS_CONFIGS_INITIAL_LOAD_TIMOUT_MS: "60000"
+  KAFKA_METADATA_MAX_IDLE_INTERVAL_MS: "500"
+
+  # ── Replication ───────────────────────────────────────────
+  KAFKA_DEFAULT_REPLICATION_FACTOR: "3"
+  KAFKA_MIN_INSYNC_REPLICAS: "2"
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "3"
+  KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: "10"
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "3"
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "2"
+  KAFKA_NUM_PARTITIONS: "3"
+
+  # ── Topic defaults ────────────────────────────────────────
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_DELETE_TOPIC_ENABLE: "true"
+  KAFKA_LOG_RETENTION_HOURS: "168"
+  KAFKA_MESSAGE_MAX_BYTES: "10485760"
+  KAFKA_COMPRESSION_TYPE: "lz4"
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+  KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+
+  # ── JVM ───────────────────────────────────────────────────
+  KAFKA_HEAP_OPTS: "-Xms512m -Xmx1g"
+  KAFKA_JVM_PERFORMANCE_OPTS: "-server -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:+ExplicitGCInvokesConcurrent -Djava.awt.headless=true"
+  KAFKA_JMX_OPTS: "-Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.port=9999 -Dcom.sun.management.jmxremote.rmi.port=9999 -Djava.rmi.server.hostname=0.0.0.0"
+
+services:
+
+  # ─────────────────────────────────────────────────────────────
+  # BROKER  (combined broker + controller, KRaft)
+  # ─────────────────────────────────────────────────────────────
+  broker:
+    image: apache/kafka:3.7.0
+    hostname: broker
+    container_name: kafka-broker
+    restart: unless-stopped
+    networks:
+      - kafka-net
+    ports:
+      - "9094:9094"
+      - "9999:9999"
+    volumes:
+      - broker-data:/var/lib/kafka/data
+      - ./secrets/kafka_server_jaas.conf:/etc/kafka/secrets/kafka_server_jaas.conf:ro
+    environment:
+      <<: *kafka-broker-common-env
+      # ── Broker-1 specific ─────────────────────────────────
+      # Setting CLUSTER_ID tells the image entrypoint to auto-run
+      # kafka-storage.sh format before starting the broker.
+      # Do NOT set a custom entrypoint — it skips this logic.
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      # Start CONTROLLER listener before the authorizer loads so
+      # the broker-controller registration completes without ACL checks.
+      KAFKA_EARLY_START_LISTENERS: "CONTROLLER,INTERNAL"
+      # INTERNAL   :9091  PLAINTEXT       inter-broker + healthcheck
+      # CLIENT     :9092  SASL_PLAINTEXT  in-docker services
+      # CONTROLLER :9093  PLAINTEXT       KRaft Raft only
+      # EXTERNAL   :9094  SASL_PLAINTEXT  host dev access
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9091,CLIENT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://broker:9091,CLIENT://broker:9092,EXTERNAL://localhost:9094"
+      # User:ANONYMOUS must be a superuser because the controller
+      # registers itself over the CONTROLLER (PLAINTEXT) listener
+      # using no credentials — it shows up as User:ANONYMOUS.
+      # This is safe because CONTROLLER port 9093 is never mapped
+      # to the host and is unreachable outside the Docker network.
+
+
+
+  # ─────────────────────────────────────────────────────────────
+  # BROKER 2  (pure broker, KRaft — no controller role)
+  # ─────────────────────────────────────────────────────────────
+  broker2:
+    image: apache/kafka:3.7.0
+    hostname: broker2
+    container_name: kafka-broker2
+    restart: unless-stopped
+    networks:
+      - kafka-net
+    ports:
+      - "9095:9094"
+      - "10000:9999"
+    volumes:
+      - broker2-data:/var/lib/kafka/data
+      - ./secrets/kafka_server_jaas.conf:/etc/kafka/secrets/kafka_server_jaas.conf:ro
+    environment:
+      <<: *kafka-broker-common-env
+      # ── Broker-2 specific ─────────────────────────────────
+      KAFKA_NODE_ID: "2"
+      KAFKA_PROCESS_ROLES: "broker"
+      KAFKA_EARLY_START_LISTENERS: "INTERNAL,EXTERNAL"
+      # INTERNAL   :9091  PLAINTEXT       inter-broker
+      # CLIENT     :9092  SASL_PLAINTEXT  in-docker services
+      # EXTERNAL   :9094  SASL_PLAINTEXT  host dev access (mapped to 9095)
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9091,CLIENT://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://broker2:9091,CLIENT://broker2:9092,EXTERNAL://localhost:9095"
+
+
+
+  # ─────────────────────────────────────────────────────────────
+  # BROKER 3  (pure broker, KRaft — no controller role)
+  # ─────────────────────────────────────────────────────────────
+  broker3:
+    image: apache/kafka:3.7.0
+    hostname: broker3
+    container_name: kafka-broker3
+    restart: unless-stopped
+    networks:
+      - kafka-net
+    ports:
+      - "9096:9094"
+      - "10001:9999"
+    volumes:
+      - broker3-data:/var/lib/kafka/data
+      - ./secrets/kafka_server_jaas.conf:/etc/kafka/secrets/kafka_server_jaas.conf:ro
+    environment:
+      <<: *kafka-broker-common-env
+      # ── Broker-3 specific ─────────────────────────────────
+      KAFKA_NODE_ID: "3"
+      KAFKA_PROCESS_ROLES: "broker"
+      KAFKA_EARLY_START_LISTENERS: "INTERNAL,EXTERNAL"
+      # INTERNAL   :9091  PLAINTEXT       inter-broker
+      # CLIENT     :9092  SASL_PLAINTEXT  in-docker services
+      # EXTERNAL   :9094  SASL_PLAINTEXT  host dev access (mapped to 9096)
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9091,CLIENT://0.0.0.0:9092,EXTERNAL://0.0.0.0:9094"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://broker3:9091,CLIENT://broker3:9092,EXTERNAL://localhost:9096"
+
+
+
+  # ─────────────────────────────────────────────────────────────
+  # KAFKA CONNECT
+  # ─────────────────────────────────────────────────────────────
+  kafka-connect:
+    image: confluentinc/cp-kafka-connect:7.6.1
+    hostname: kafka-connect
+    container_name: kafka-connect
+    restart: unless-stopped
+    depends_on:
+      broker:
+        condition: service_started
+      broker2:
+        condition: service_started
+      broker3:
+        condition: service_started
+      topic-acl-init:
+        condition: service_completed_successfully
+    networks:
+      - kafka-net
+    ports:
+      - "8083:8083"
+    volumes:
+      - connect-plugins:/usr/share/confluent-hub-components
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: "broker:9092,broker2:9092,broker3:9092"
+      CONNECT_SECURITY_PROTOCOL: "SASL_PLAINTEXT"
+      CONNECT_SASL_MECHANISM: "PLAIN"
+      CONNECT_SASL_JAAS_CONFIG: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"connect-worker\" password=\"connect-secret\";"
+      CONNECT_PRODUCER_SECURITY_PROTOCOL: "SASL_PLAINTEXT"
+      CONNECT_PRODUCER_SASL_MECHANISM: "PLAIN"
+      CONNECT_PRODUCER_SASL_JAAS_CONFIG: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"connect-worker\" password=\"connect-secret\";"
+      CONNECT_CONSUMER_SECURITY_PROTOCOL: "SASL_PLAINTEXT"
+      CONNECT_CONSUMER_SASL_MECHANISM: "PLAIN"
+      CONNECT_CONSUMER_SASL_JAAS_CONFIG: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"connect-worker\" password=\"connect-secret\";"
+      CONNECT_REST_ADVERTISED_HOST_NAME: "kafka-connect"
+      CONNECT_REST_PORT: "8083"
+      CONNECT_GROUP_ID: "kafka-connect-cluster"
+      CONNECT_CONFIG_STORAGE_TOPIC: "_connect-configs"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "3"
+      CONNECT_OFFSET_STORAGE_TOPIC: "_connect-offsets"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "3"
+      CONNECT_OFFSET_FLUSH_INTERVAL_MS: "10000"
+      CONNECT_STATUS_STORAGE_TOPIC: "_connect-status"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "3"
+      CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.storage.StringConverter"
+      CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
+      CONNECT_PLUGIN_DISCOVERY: "only_scan"
+      CONNECT_LOG4J_ROOT_LOGLEVEL: "WARN"
+      CONNECT_HEAP_OPTS: "-Xms256m -Xmx512m"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8083/connectors"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ─────────────────────────────────────────────────────────────
+  # KAFKA UI
+  # ─────────────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    hostname: kafka-ui
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      broker:
+        condition: service_started
+      broker2:
+        condition: service_started
+      broker3:
+        condition: service_started
+      topic-acl-init:
+        condition: service_completed_successfully
+    networks:
+      - kafka-net
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: "simple-kafka"
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "broker:9092,broker2:9092,broker3:9092"
+      KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL: "SASL_PLAINTEXT"
+      KAFKA_CLUSTERS_0_PROPERTIES_SASL_MECHANISM: "PLAIN"
+      KAFKA_CLUSTERS_0_PROPERTIES_SASL_JAAS_CONFIG: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"kafka-ui\" password=\"kafka-ui-secret\";"
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: "connect-cluster"
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: "http://kafka-connect:8083"
+      AUTH_TYPE: "LOGIN_FORM"
+      SPRING_SECURITY_USER_NAME: "admin"
+      SPRING_SECURITY_USER_PASSWORD: "admin-secret"
+      DYNAMIC_CONFIG_ENABLED: "true"
+      LOGGING_LEVEL_ROOT: "WARN"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ─────────────────────────────────────────────────────────────
+  # TOPIC + ACL INIT  (one-shot)
+  # ─────────────────────────────────────────────────────────────
+  topic-acl-init:
+    image: apache/kafka:3.7.0
+    container_name: topic-acl-init
+    restart: on-failure
+    depends_on:
+      broker:
+        condition: service_started
+      broker2:
+        condition: service_started
+      broker3:
+        condition: service_started
+    networks:
+      - kafka-net
+    volumes:
+      - ./secrets/admin.properties:/etc/kafka/secrets/admin.properties:ro
+      - ./scripts/init.sh:/init.sh:ro
+    entrypoint: ["/bin/bash", "/init.sh"]
+    environment:
+      BOOTSTRAP_SERVERS: "broker:9092,broker2:9092,broker3:9092"
