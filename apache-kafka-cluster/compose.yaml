@@ -1,7 +1,8 @@
 ---
 # ============================================================
 # Simple Kafka — 3 Brokers, KRaft (no ZooKeeper)
-# Services: broker, broker2, broker3, kafka-connect, kafka-ui, topic-acl-init
+# Services: broker, broker2, broker3, schema-registry,
+#           kafka-connect, kafka-ui, topic-acl-init, schema-init
 #
 # Key fixes in this version:
 #  ✔ NO custom entrypoint — apache/kafka handles storage format
@@ -175,6 +176,69 @@ services:
 
 
   # ─────────────────────────────────────────────────────────────
+  # SCHEMA REGISTRY  (Confluent)
+  # ─────────────────────────────────────────────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    hostname: schema-registry
+    container_name: schema-registry
+    restart: unless-stopped
+    depends_on:
+      broker:
+        condition: service_started
+      broker2:
+        condition: service_started
+      broker3:
+        condition: service_started
+      topic-acl-init:
+        condition: service_completed_successfully
+    networks:
+      - kafka-net
+    ports:
+      - "8081:8081"
+    environment:
+      # ── Listeners ────────────────────────────────────────
+      SCHEMA_REGISTRY_HOST_NAME: "schema-registry"
+      SCHEMA_REGISTRY_LISTENERS: "http://0.0.0.0:8081"
+      # ── Kafka store ──────────────────────────────────────
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "broker:9092,broker2:9092,broker3:9092"
+      SCHEMA_REGISTRY_KAFKASTORE_SECURITY_PROTOCOL: "SASL_PLAINTEXT"
+      SCHEMA_REGISTRY_KAFKASTORE_SASL_MECHANISM: "PLAIN"
+      SCHEMA_REGISTRY_KAFKASTORE_SASL_JAAS_CONFIG: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"schema-registry\" password=\"schema-registry-secret\";"
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC: "_schemas"
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: "3"
+      # ── Schema compatibility ──────────────────────────────
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: "FULL_TRANSITIVE"
+      # ── Logging ──────────────────────────────────────────
+      SCHEMA_REGISTRY_LOG4J_ROOT_LOGLEVEL: "WARN"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8081/subjects"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+
+  # ─────────────────────────────────────────────────────────────
+  # SCHEMA INIT  (one-shot — registers Avro schemas)
+  # ─────────────────────────────────────────────────────────────
+  schema-init:
+    image: curlimages/curl:8.7.1
+    container_name: schema-init
+    restart: on-failure
+    depends_on:
+      schema-registry:
+        condition: service_healthy
+    networks:
+      - kafka-net
+    volumes:
+      - ./scripts/schema-init.sh:/schema-init.sh:ro
+    entrypoint: ["/bin/sh", "/schema-init.sh"]
+    environment:
+      SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+
+
+  # ─────────────────────────────────────────────────────────────
   # KAFKA CONNECT
   # ─────────────────────────────────────────────────────────────
   kafka-connect:
@@ -190,6 +254,10 @@ services:
       broker3:
         condition: service_started
       topic-acl-init:
+        condition: service_completed_successfully
+      schema-registry:
+        condition: service_healthy
+      schema-init:
         condition: service_completed_successfully
     networks:
       - kafka-net
@@ -221,6 +289,10 @@ services:
       CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.storage.StringConverter"
       CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
       CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      # ── Schema Registry (used when Avro converters are set per-connector) ─
+      CONNECT_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
       CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components"
       CONNECT_PLUGIN_DISCOVERY: "only_scan"
       CONNECT_LOG4J_ROOT_LOGLEVEL: "WARN"
@@ -249,6 +321,10 @@ services:
         condition: service_started
       topic-acl-init:
         condition: service_completed_successfully
+      schema-registry:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
     networks:
       - kafka-net
     ports:
@@ -261,6 +337,9 @@ services:
       KAFKA_CLUSTERS_0_PROPERTIES_SASL_JAAS_CONFIG: "org.apache.kafka.common.security.plain.PlainLoginModule required username=\"kafka-ui\" password=\"kafka-ui-secret\";"
       KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: "connect-cluster"
       KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: "http://kafka-connect:8083"
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: "http://schema-registry:8081"
+      KAFKA_CLUSTERS_0_DEFAULTKEYSERDE: "SchemaRegistry"
+      KAFKA_CLUSTERS_0_DEFAULTVALUESERDE: "SchemaRegistry"
       AUTH_TYPE: "LOGIN_FORM"
       SPRING_SECURITY_USER_NAME: "admin"
       SPRING_SECURITY_USER_PASSWORD: "admin-secret"

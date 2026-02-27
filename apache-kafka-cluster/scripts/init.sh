@@ -92,6 +92,19 @@ create_topic "orders-events"   3  604800000  delete
 create_topic "payments-events" 3  604800000  delete
 create_topic "dead-letter"     1  -1         delete
 
+# Schema Registry internal topic — compacted, RF=3, single partition
+if $KT --describe --topic "_schemas" > /dev/null 2>&1; then
+  echo "  ⏭  topic '_schemas' already exists"
+else
+  $KT --create --topic "_schemas" \
+    --partitions 1 \
+    --replication-factor 3 \
+    --config "cleanup.policy=compact" \
+    --config "min.insync.replicas=2" \
+    --config "retention.ms=-1"
+  echo "  ✅ created topic '_schemas'"
+fi
+
 # ── connect-worker ACLs ───────────────────────────────────────
 echo ""
 echo "🔐 connect-worker ACLs..."
@@ -141,6 +154,37 @@ $KA --add \
   --allow-host "*"
 echo "  🔐 Group:connect-* [Read] → User:connect-worker"
 
+# ── schema-registry ACLs ─────────────────────────────────────
+echo ""
+echo "🔐 schema-registry ACLs..."
+$KA --add \
+  --allow-principal "User:schema-registry" \
+  --topic "_schemas" \
+  --operation Read \
+  --operation Write \
+  --operation Create \
+  --operation Describe \
+  --operation DescribeConfigs \
+  --allow-host "*"
+echo "  🔐 Topic:_schemas [Read,Write,Create,Describe,DescribeConfigs] → User:schema-registry"
+
+$KA --add \
+  --allow-principal "User:schema-registry" \
+  --cluster \
+  --operation Describe \
+  --operation DescribeConfigs \
+  --allow-host "*"
+echo "  🔐 Cluster [Describe,DescribeConfigs] → User:schema-registry"
+
+# Consumer group used by the leader-election JoinGroup protocol
+$KA --add \
+  --allow-principal "User:schema-registry" \
+  --group "schema-registry" \
+  --operation Read \
+  --operation Describe \
+  --allow-host "*"
+echo "  🔐 Group:schema-registry [Read,Describe] → User:schema-registry"
+
 # ── Application service accounts ─────────────────────────────
 echo ""
 echo "🔐 Application ACLs..."
@@ -177,6 +221,13 @@ $KA --add \
   --allow-principal "User:kafka-ui" \
   --topic "_connect-" \
   --resource-pattern-type prefixed \
+  --operation Describe \
+  --operation Read \
+  --allow-host "*"
+# Allow kafka-ui to browse _schemas (Schema Registry backing topic)
+$KA --add \
+  --allow-principal "User:kafka-ui" \
+  --topic "_schemas" \
   --operation Describe \
   --operation Read \
   --allow-host "*"
