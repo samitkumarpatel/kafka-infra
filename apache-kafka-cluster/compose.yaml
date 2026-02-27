@@ -1,6 +1,6 @@
 ---
 # ============================================================
-# Simple Kafka — 3 Brokers, KRaft (no ZooKeeper)
+# apache-kafka-cluster — 3 Brokers, KRaft (no ZooKeeper)
 # Services: broker, broker2, broker3, schema-registry,
 #           kafka-connect, kafka-ui, topic-acl-init, schema-init
 #
@@ -330,7 +330,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      KAFKA_CLUSTERS_0_NAME: "simple-kafka"
+      KAFKA_CLUSTERS_0_NAME: "apache-kafka-cluster"
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "broker:9092,broker2:9092,broker3:9092"
       KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL: "SASL_PLAINTEXT"
       KAFKA_CLUSTERS_0_PROPERTIES_SASL_MECHANISM: "PLAIN"

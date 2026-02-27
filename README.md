@@ -1,7 +1,7 @@
 # apache-kafka-cluster
 
 A production-inspired local Kafka cluster using **Apache Kafka 3.7 in KRaft mode** (no ZooKeeper).  
-3 brokers, SASL/PLAIN authentication, StandardAuthorizer ACLs, Kafka Connect, and Kafka UI — all in Docker Compose.
+3 brokers, SASL/PLAIN authentication, StandardAuthorizer ACLs, Confluent Schema Registry, Kafka Connect, and Kafka UI — all in Docker Compose.
 
 ---
 
@@ -14,6 +14,7 @@ A production-inspired local Kafka cluster using **Apache Kafka 3.7 in KRaft mode
 - [Credentials](#credentials)
 - [Quick Start](#quick-start)
 - [ACL Configuration](#acl-configuration)
+- [Schema Registry](#schema-registry)
 - [Producer & Consumer Examples](#producer--consumer-examples)
 - [Administration](#administration)
 
@@ -28,25 +29,32 @@ graph LR
         C["Consumer\nlocalhost:9094-9096"]
         UI["Kafka UI\nlocalhost:8080"]
         API["Connect REST\nlocalhost:8083"]
+        SR["Schema Registry\nlocalhost:8081"]
     end
 
     subgraph DOCKER["🐳 kafka-net"]
         B1["broker\n● controller\n● broker"]
         B2["broker2\n● broker"]
         B3["broker3\n● broker"]
+        SREG["schema-registry"]
         KC["kafka-connect"]
         KUI["kafka-ui"]
         INIT["topic-acl-init\none-shot"]
+        SINIT["schema-init\none-shot"]
     end
 
     P -- "SASL_PLAINTEXT" --> B1 & B2 & B3
     C -- "SASL_PLAINTEXT" --> B1 & B2 & B3
     UI --> KUI
     API --> KC
+    SR --> SREG
     KC -- "SASL_PLAINTEXT" --> B1 & B2 & B3
     KUI -- "SASL_PLAINTEXT" --> B1 & B2 & B3
+    SREG -- "SASL_PLAINTEXT" --> B1 & B2 & B3
     INIT -. "init then exit" .-> B1
-    INIT -. "unblocks" .-> KC & KUI
+    INIT -. "unblocks" .-> SREG
+    SINIT -. "registers schemas" .-> SREG
+    SINIT -. "unblocks" .-> KC & KUI
 ```
 
 <details>
@@ -60,6 +68,7 @@ graph TB
         H3["localhost:9096"]
         HUI["localhost:8080\nKafka UI"]
         HCONN["localhost:8083\nKafka Connect REST"]
+        HSR["localhost:8081\nSchema Registry"]
     end
 
     subgraph NET["🐳 Docker Network: kafka-net"]
@@ -69,9 +78,11 @@ graph TB
             B3["broker3\nnode-id: 3\nrole: broker only\nCLIENT :9092 · INTERNAL :9091\nEXTERNAL :9094"]
         end
 
+        SREG["schema-registry\nconfluentinc/cp-schema-registry:7.6.1\nport: 8081"]
         CONNECT["kafka-connect\nconfluentinc/cp-kafka-connect:7.6.1\nport: 8083"]
         UI["kafka-ui\nprovectuslabs/kafka-ui:latest\nport: 8080"]
         INIT["topic-acl-init\n(one-shot · apache/kafka:3.7.0)\ncreates topics + ACLs then exits"]
+        SINIT["schema-init\n(one-shot · curlimages/curl)\nregisters Avro schemas then exits"]
     end
 
     %% KRaft controller quorum
@@ -84,6 +95,10 @@ graph TB
     B2 <-- "replication\n(INTERNAL :9091 · PLAINTEXT)" --> B3
 
     %% Services → brokers (inside Docker, CLIENT listener)
+    SREG -- "SASL_PLAINTEXT\nCLIENT :9092" --> B1
+    SREG -- "SASL_PLAINTEXT\nCLIENT :9092" --> B2
+    SREG -- "SASL_PLAINTEXT\nCLIENT :9092" --> B3
+
     CONNECT -- "SASL_PLAINTEXT\nCLIENT :9092" --> B1
     CONNECT -- "SASL_PLAINTEXT\nCLIENT :9092" --> B2
     CONNECT -- "SASL_PLAINTEXT\nCLIENT :9092" --> B3
@@ -94,6 +109,13 @@ graph TB
 
     INIT -- "admin · SASL_PLAINTEXT\nCLIENT :9092" --> B1
 
+    %% Schema init → Schema Registry
+    SINIT -- "registers schemas\nHTTP :8081" --> SREG
+
+    %% Connect + UI → Schema Registry
+    CONNECT -- "HTTP :8081" --> SREG
+    UI -- "HTTP :8081" --> SREG
+
     %% Host → brokers (EXTERNAL listener)
     H1 -- "EXTERNAL\nSASL_PLAINTEXT" --> B1
     H2 -- "EXTERNAL\nSASL_PLAINTEXT" --> B2
@@ -102,19 +124,21 @@ graph TB
     %% Host → services
     HUI --> UI
     HCONN --> CONNECT
+    HSR --> SREG
 
     %% Startup dependency
-    INIT -. "must complete before" .-> CONNECT
-    INIT -. "must complete before" .-> UI
+    INIT -. "must complete before" .-> SREG
+    SINIT -. "must complete before" .-> CONNECT
+    SINIT -. "must complete before" .-> UI
 
     classDef broker fill:#1a6b3a,color:#fff,stroke:#0d4a28
     classDef service fill:#1a4a8a,color:#fff,stroke:#0d2d5a
     classDef init fill:#7a4a00,color:#fff,stroke:#5a3300
     classDef host fill:#4a4a4a,color:#fff,stroke:#2a2a2a
     class B1,B2,B3 broker
-    class CONNECT,UI service
-    class INIT init
-    class H1,H2,H3,HUI,HCONN host
+    class SREG,CONNECT,UI service
+    class INIT,SINIT init
+    class H1,H2,H3,HUI,HCONN,HSR host
 ```
 
 </details>
@@ -123,6 +147,7 @@ graph TB
 - All inter-broker traffic uses the `INTERNAL` (PLAINTEXT) listener on port `9091`.
 - All client traffic inside Docker uses the `CLIENT` (SASL_PLAINTEXT) listener on port `9092`.
 - Host access uses the `EXTERNAL` (SASL_PLAINTEXT) listener mapped to `9094`, `9095`, `9096`.
+- Schema Registry starts after `topic-acl-init` completes. `schema-init` then registers Avro schemas, and only after that do `kafka-connect` and `kafka-ui` start.
 
 ---
 
@@ -132,10 +157,14 @@ graph TB
 apache-kafka-cluster/
 ├── compose.yaml                  # Docker Compose stack definition
 ├── scripts/
-│   └── init.sh                   # One-shot topic creation + ACL setup script
+│   ├── init.sh                   # One-shot topic creation + ACL setup script
+│   └── schema-init.sh            # One-shot Avro schema registration script
 └── secrets/
     ├── admin.properties          # Admin credentials for use INSIDE containers
     ├── host-admin.properties     # Admin credentials for use from the HOST machine
+    ├── orders-producer.properties    # orders-producer client credentials
+    ├── payments-consumer.properties  # payments-consumer client credentials
+    ├── analytics-reader.properties   # analytics-reader client credentials (add user to JAAS first)
     └── kafka_server_jaas.conf    # JAAS config — broker-side user/password registry
 ```
 
@@ -143,14 +172,15 @@ apache-kafka-cluster/
 
 Defines the full stack. Key design decisions:
 - Uses a **YAML anchor** (`x-kafka-broker-common-env`) to share ~25 common env vars across all three brokers, avoiding repetition.
-- `topic-acl-init` runs first and creates all topics + ACLs; `kafka-connect` and `kafka-ui` depend on it completing successfully.
+- `topic-acl-init` runs first and creates all topics + ACLs (including `_schemas`); `schema-registry` depends on it completing successfully.
+- `schema-init` runs after `schema-registry` is healthy and registers all Avro schemas; `kafka-connect` and `kafka-ui` depend on it completing successfully.
 - `version: "3.9"` with named volumes for persistent broker data.
 
 ### `scripts/init.sh`
 
 Runs once at startup inside the `topic-acl-init` container. Responsibilities:
 1. **Waits** for the broker to be reachable (polls `kafka-broker-api-versions.sh`).
-2. **Creates topics** using `kafka-topics.sh` (idempotent — skips if already exists).
+2. **Creates topics** using `kafka-topics.sh` (idempotent — skips if already exists), including the Schema Registry backing topic `_schemas` (compacted, RF=3, single partition).
 3. **Grants ACLs** using `kafka-acls.sh` for all service accounts.
 
 Helper functions defined in the script:
@@ -160,6 +190,19 @@ Helper functions defined in the script:
 | `create_topic <name> <partitions> <retention-ms> <cleanup-policy>` | Creates a topic with standard configs |
 | `acl_topic <user> <topic> <op1> [op2...]` | Grants one or more operations on a topic |
 | `acl_group <user> <group>` | Grants `Read + Describe` on a named consumer group, **locking** the user to only that group |
+
+### `scripts/schema-init.sh`
+
+Runs once at startup inside the `schema-init` container. Responsibilities:
+1. **Waits** for Schema Registry to be reachable (polls `GET /subjects`).
+2. **Registers Avro schemas** for every application topic (both `-key` and `-value` subjects) using `POST /subjects/<subject>/versions`.
+3. Idempotent — re-registering an identical schema returns the existing schema ID.
+
+Helper function defined in the script:
+
+| Function | Purpose |
+|---|---|
+| `register_schema <subject> <schema-type> <schema-json>` | POSTs a schema to Schema Registry; succeeds on both `200` (new) and `409` (already exists) |
 
 ### `secrets/kafka_server_jaas.conf`
 
@@ -173,6 +216,7 @@ KafkaServer {
   user_admin="admin-secret"
   user_connect-worker="connect-secret"
   user_kafka-ui="kafka-ui-secret"
+  user_schema-registry="schema-registry-secret"
   user_orders-producer="orders-prod-secret"
   user_payments-consumer="payments-cons-secret";
 };
@@ -256,6 +300,7 @@ Listeners:
 | Bootstrap | `broker:9092,broker2:9092,broker3:9092` |
 | Auth user | `connect-worker` |
 | Internal topics replication | `3` |
+| Schema Registry URL | `http://schema-registry:8081` |
 | Volume | `connect-plugins` (for connector JARs) |
 
 Kafka Connect runs as user `connect-worker` and has ACLs to read/write application topics and manage its own internal `_connect-*` topics.
@@ -268,10 +313,12 @@ Kafka Connect runs as user `connect-worker` and has ACLs to read/write applicati
 | Port | `8080` |
 | Bootstrap | `broker:9092,broker2:9092,broker3:9092` |
 | Auth user | `kafka-ui` |
+| Schema Registry | `http://schema-registry:8081` |
+| Default serde | `SchemaRegistry` (key + value) |
 | Login | `admin` / `admin-secret` |
 | URL | http://localhost:8080 |
 
-Kafka UI runs as user `kafka-ui` which has `Describe + Read` on all topics and `Describe + Read` on all consumer groups (required to browse messages).
+Kafka UI runs as user `kafka-ui` which has `Describe + Read` on all topics (including `_schemas` and `_connect-*`) and `Describe + Read` on all consumer groups. It is connected to Schema Registry and automatically deserialises Avro messages in the message browser.
 
 ### `topic-acl-init`
 
@@ -282,7 +329,31 @@ Kafka UI runs as user `kafka-ui` which has `Describe + Read` on all topics and `
 | Script | `scripts/init.sh` |
 | Config | `secrets/admin.properties` |
 
-Runs `init.sh` at startup. Creates all topics and ACLs, then exits `0`. `kafka-connect` and `kafka-ui` wait for this to complete before starting.
+Runs `init.sh` at startup. Creates all topics (including `_schemas`) and ACLs, then exits `0`. `schema-registry` waits for this to complete before starting.
+
+### `schema-registry`
+
+| Item | Value |
+|---|---|
+| Image | `confluentinc/cp-schema-registry:7.6.1` |
+| Port | `8081` (HTTP REST API) |
+| Bootstrap | `broker:9092,broker2:9092,broker3:9092` |
+| Auth user | `schema-registry` |
+| Backing topic | `_schemas` (compacted, RF=3) |
+| Compatibility | `FULL_TRANSITIVE` |
+| URL | http://localhost:8081 |
+
+Stores all registered schemas in the `_schemas` Kafka topic. Kafka Connect and Kafka UI are both configured to use it for schema lookup.
+
+### `schema-init`
+
+| Item | Value |
+|---|---|
+| Image | `curlimages/curl:8.7.1` |
+| Type | One-shot (`restart: on-failure`) |
+| Script | `scripts/schema-init.sh` |
+
+Runs after `schema-registry` is healthy. Registers Avro schemas for all application topics (`orders`, `payments`, `orders-events`, `payments-events`, `dead-letter`) — both `-key` and `-value` subjects. `kafka-connect` and `kafka-ui` wait for this to complete before starting.
 
 ---
 
@@ -296,6 +367,7 @@ Runs `init.sh` at startup. Creates all topics and ACLs, then exits `0`. `kafka-c
 | `9999` | broker | JMX | RMI |
 | `10000` | broker2 | JMX | RMI |
 | `10001` | broker3 | JMX | RMI |
+| `8081` | schema-registry | REST | HTTP |
 | `8083` | kafka-connect | REST | HTTP |
 | `8080` | kafka-ui | Web | HTTP |
 
@@ -314,6 +386,7 @@ localhost:9094,localhost:9095,localhost:9096
 | `admin` | `admin-secret` | **Superuser** — bypasses all ACLs |
 | `connect-worker` | `connect-secret` | Kafka Connect internal user |
 | `kafka-ui` | `kafka-ui-secret` | Kafka UI read/describe user |
+| `schema-registry` | `schema-registry-secret` | Schema Registry Kafka store user |
 | `orders-producer` | `orders-prod-secret` | Application producer |
 | `payments-consumer` | `payments-cons-secret` | Application consumer |
 
@@ -331,9 +404,15 @@ docker compose ps
 # View init log (topic + ACL creation)
 docker compose logs topic-acl-init
 
+# View schema init log (Avro schema registration)
+docker compose logs schema-init
+
 # Open Kafka UI
 open http://localhost:8080
 # Login: admin / admin-secret
+
+# Open Schema Registry (list registered subjects)
+curl http://localhost:8081/subjects
 
 # Tear down (including volumes)
 docker compose down -v
@@ -404,12 +483,23 @@ If either is missing, the broker rejects the request. The group ACL acts as a **
 
 > Locked to consumer group `analytics-cg` only.
 
+#### `schema-registry`
+
+| Resource | Operations |
+|---|---|
+| Topic `_schemas` | Read, Write, Create, Describe, DescribeConfigs |
+| Cluster | Describe, DescribeConfigs |
+| Group `schema-registry` | Read, Describe |
+
+> The group ACL covers Schema Registry's internal leader-election (JoinGroup) protocol.
+
 #### `kafka-ui`
 
 | Resource | Operations |
 |---|---|
 | All app topics | Describe, Read |
 | Topic `_connect-*` (prefix) | Describe, Read |
+| Topic `_schemas` | Describe, Read |
 | Group `*` (wildcard) | Describe, Read |
 
 ### Adding a New Service Account
@@ -431,104 +521,354 @@ If either is missing, the broker rejects the request. The group ACL acts as a **
 
 ---
 
-## Producer & Consumer Examples
+## Schema Registry
 
-All commands below run from the `apache-kafka-cluster/` directory on your Mac host.
+Schema Registry is available at **http://localhost:8081** and stores schemas in the `_schemas` Kafka topic.
 
-### Using `admin` (superuser — bypasses ACLs)
+### Compatibility mode
+
+All subjects default to `FULL_TRANSITIVE` — every new schema version must be forward- and backward-compatible with **all** previous versions, not just the latest.
+
+### Registered subjects (bootstrapped by `schema-init`)
+
+| Subject | Schema |
+|---|---|
+| `orders-key` | `{"type":"string"}` |
+| `orders-value` | `{"type":"string"}` |
+| `payments-key` | `{"type":"string"}` |
+| `payments-value` | `{"type":"string"}` |
+| `orders-events-key` | `{"type":"string"}` |
+| `orders-events-value` | `{"type":"string"}` |
+| `payments-events-key` | `{"type":"string"}` |
+| `payments-events-value` | `{"type":"string"}` |
+| `dead-letter-key` | `{"type":"string"}` |
+| `dead-letter-value` | `{"type":"string"}` |
+
+### REST API quick reference
 
 ```bash
-# Produce
-kafka-console-producer.sh \
+# List all registered subjects
+curl http://localhost:8081/subjects
+
+# Get all versions of a subject
+curl http://localhost:8081/subjects/orders-value/versions
+
+# Fetch a specific version
+curl http://localhost:8081/subjects/orders-value/versions/1
+
+# Register a new Avro schema
+curl -X POST http://localhost:8081/subjects/orders-value/versions \
+  -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  -d '{
+    "schemaType": "AVRO",
+    "schema": "{\"type\":\"record\",\"name\":\"Order\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"},{\"name\":\"amount\",\"type\":\"double\"}]}"
+  }'
+
+# Check compatibility of a candidate schema before registering
+curl -X POST http://localhost:8081/compatibility/subjects/orders-value/versions/latest \
+  -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  -d '{
+    "schemaType": "AVRO",
+    "schema": "{\"type\":\"record\",\"name\":\"Order\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"},{\"name\":\"amount\",\"type\":\"double\"},{\"name\":\"currency\",\"type\":\"string\",\"default\":\"USD\"}]}"
+  }'
+
+# Get schema by global ID
+curl http://localhost:8081/schemas/ids/1
+
+# Check current global compatibility level
+curl http://localhost:8081/config
+
+# Override compatibility for a single subject
+curl -X PUT http://localhost:8081/config/orders-value \
+  -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+  -d '{"compatibility": "BACKWARD"}'
+
+# Delete a subject (all versions) — soft delete
+curl -X DELETE http://localhost:8081/subjects/orders-value
+
+# View schema-init logs
+docker compose logs schema-init
+```
+
+### Kafka Connect + Schema Registry
+
+`kafka-connect` is pre-configured with the Schema Registry URL. To enable Avro serialisation for a connector, override the converter per-connector in the connector config:
+
+```json
+{
+  "key.converter": "io.confluent.connect.avro.AvroConverter",
+  "key.converter.schema.registry.url": "http://schema-registry:8081",
+  "value.converter": "io.confluent.connect.avro.AvroConverter",
+  "value.converter.schema.registry.url": "http://schema-registry:8081"
+}
+```
+
+### Kafka UI + Schema Registry
+
+Kafka UI is connected to Schema Registry (`KAFKA_CLUSTERS_0_SCHEMAREGISTRY`) with `SchemaRegistry` set as the default key and value serde. Messages in topics with registered schemas are automatically deserialized in the UI message browser.
+
+---
+
+## Producer & Consumer Examples
+
+All commands below run from the `apache-kafka-cluster/` directory on your host.  
+They use the **Confluent CLI** tools: `kafka-console-producer`, `kafka-console-consumer`, `kafka-avro-console-producer`, and `kafka-avro-console-consumer`.
+
+> **Prerequisites — Install Confluent Platform CLI tools**  
+> The Avro console tools (`kafka-avro-console-producer` / `kafka-avro-console-consumer`) are **not** included in the Apache Kafka distribution. Install Confluent Platform (Community Edition) from the zip/tar archive:
+>
+> 1. Download the archive from the [Confluent zip/tar installation page](https://docs.confluent.io/platform/current/installation/installing_cp/zip-tar.html#get-the-software).
+> 2. Extract and add the `bin/` directory to your `PATH`:
+>    ```bash
+>    tar -xzf confluent-<version>.tar.gz
+>    export PATH="$PWD/confluent-<version>/bin:$PATH"
+>    ```
+> 3. Verify:
+>    ```bash
+>    kafka-avro-console-producer --version
+>    ```
+
+> **SASL with Confluent CLI tools:** Always pass credentials via a **properties file** using `--producer.config` / `--consumer.config`.  
+> Passing `sasl.jaas.config` inline via `--producer-property` / `--consumer-property` causes:
+> ```
+> SaslAuthenticationException: Failed to configure SaslClientAuthenticator
+> UnsupportedOperationException: getSubject is not supported
+> ```
+
+The per-user properties files are committed under `secrets/` and ready to use:
+
+| File | User | Password |
+|---|---|---|
+| `secrets/host-admin.properties` | `admin` | `admin-secret` |
+| `secrets/orders-producer.properties` | `orders-producer` | `orders-prod-secret` |
+| `secrets/payments-consumer.properties` | `payments-consumer` | `payments-cons-secret` |
+| `secrets/analytics-reader.properties` | `analytics-reader` | `analytics-reader-secret` |
+
+> **Note:** `analytics-reader` is not yet defined in `secrets/kafka_server_jaas.conf`. Add `user_analytics-reader="analytics-reader-secret"` there and restart the brokers before using `secrets/analytics-reader.properties`.
+
+---
+
+### Using `admin` (superuser — bypasses all ACLs)
+
+`admin` is a superuser. Every produce and consume attempt succeeds regardless of topic or group name.
+
+#### Plain string
+
+```bash
+# ✅ Produce — always allowed (superuser)
+kafka-console-producer \
   --bootstrap-server localhost:9094 \
   --topic orders \
   --producer.config secrets/host-admin.properties
 
-# Consume
-kafka-console-consumer.sh \
+# ✅ Consume — always allowed (superuser)
+kafka-console-consumer \
   --bootstrap-server localhost:9094 \
   --topic orders \
+  --group any-group \
   --from-beginning \
   --consumer.config secrets/host-admin.properties
 ```
 
-### Using `orders-producer` (write-only)
+#### Avro (with Schema Registry)
 
 ```bash
-# Produce — allowed
-kafka-console-producer.sh \
+# ✅ Produce Avro — superuser, schema registered/looked up via Schema Registry
+kafka-avro-console-producer \
   --bootstrap-server localhost:9094 \
   --topic orders \
-  --producer-property security.protocol=SASL_PLAINTEXT \
-  --producer-property sasl.mechanism=PLAIN \
-  --producer-property 'sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="orders-producer" password="orders-prod-secret";'
+  --property schema.registry.url=http://localhost:8081 \
+  --property value.schema='{"type":"record","name":"Order","fields":[{"name":"id","type":"string"},{"name":"amount","type":"double"}]}' \
+  --producer.config secrets/host-admin.properties
+# Input: {"id":"ord-1","amount":99.99}
 
-# Consume — denied (no topic Read ACL, no group ACL)
-kafka-console-consumer.sh \
+# ✅ Consume Avro — schema ID in message wire format resolved from Schema Registry
+kafka-avro-console-consumer \
+  --bootstrap-server localhost:9094 \
+  --topic orders \
+  --group admin-cg \
+  --from-beginning \
+  --property schema.registry.url=http://localhost:8081 \
+  --consumer.config secrets/host-admin.properties
+```
+
+---
+
+### Using `orders-producer` (write-only, no consumer group ACL)
+
+`orders-producer` has `Write + Describe` on `orders` and `dead-letter` only — no `Read` ACL and no group ACL.
+
+#### Plain string
+
+```bash
+# ✅ Produce to `orders` — allowed (Write ACL)
+kafka-console-producer \
+  --bootstrap-server localhost:9094 \
+  --topic orders \
+  --producer.config secrets/orders-producer.properties
+
+# ❌ Produce to `payments` — denied (no Write ACL on payments)
+kafka-console-producer \
+  --bootstrap-server localhost:9094 \
+  --topic payments \
+  --producer.config secrets/orders-producer.properties
+# → TopicAuthorizationException
+
+# ❌ Consume from `orders` — denied (no Read ACL, no group ACL)
+kafka-console-consumer \
   --bootstrap-server localhost:9094 \
   --topic orders \
   --group any-group \
-  --consumer-property security.protocol=SASL_PLAINTEXT \
-  --consumer-property sasl.mechanism=PLAIN \
-  --consumer-property 'sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="orders-producer" password="orders-prod-secret";'
+  --from-beginning \
+  --consumer.config secrets/orders-producer.properties
 # → TopicAuthorizationException
 ```
 
-### Using `payments-consumer` (group-locked consumer)
+#### Avro (with Schema Registry)
 
 ```bash
-# Consume with CORRECT group — allowed
-kafka-console-consumer.sh \
+# ✅ Produce Avro to `orders` — allowed
+kafka-avro-console-producer \
+  --bootstrap-server localhost:9094 \
+  --topic orders \
+  --property schema.registry.url=http://localhost:8081 \
+  --property value.schema='{"type":"record","name":"Order","fields":[{"name":"id","type":"string"},{"name":"amount","type":"double"}]}' \
+  --producer.config secrets/orders-producer.properties
+# Input: {"id":"ord-1","amount":99.99}
+
+# ❌ Consume Avro from `orders` — denied (no Read ACL, no group ACL)
+kafka-avro-console-consumer \
+  --bootstrap-server localhost:9094 \
+  --topic orders \
+  --group any-group \
+  --from-beginning \
+  --property schema.registry.url=http://localhost:8081 \
+  --consumer.config secrets/orders-producer.properties
+# → TopicAuthorizationException
+```
+
+---
+
+### Using `payments-consumer` (group-locked consumer)
+
+`payments-consumer` has `Read` on `orders`, `Write` on `payments` and `dead-letter`, and a **group lock** to `payments-cg` only.
+
+#### Plain string
+
+```bash
+# ✅ Consume `orders` with CORRECT group `payments-cg` — allowed
+kafka-console-consumer \
   --bootstrap-server localhost:9094 \
   --topic orders \
   --group payments-cg \
   --from-beginning \
-  --consumer-property security.protocol=SASL_PLAINTEXT \
-  --consumer-property sasl.mechanism=PLAIN \
-  --consumer-property 'sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="payments-consumer" password="payments-cons-secret";'
+  --consumer.config secrets/payments-consumer.properties
 
-# Consume with WRONG group — denied
-kafka-console-consumer.sh \
+# ❌ Consume `orders` with WRONG group — denied (group ACL mismatch)
+kafka-console-consumer \
   --bootstrap-server localhost:9094 \
   --topic orders \
   --group wrong-group \
   --from-beginning \
-  --consumer-property security.protocol=SASL_PLAINTEXT \
-  --consumer-property sasl.mechanism=PLAIN \
-  --consumer-property 'sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="payments-consumer" password="payments-cons-secret";'
+  --consumer.config secrets/payments-consumer.properties
+# → GroupAuthorizationException
+
+# ❌ Consume `payments` — denied (no Read ACL on payments for this user)
+kafka-console-consumer \
+  --bootstrap-server localhost:9094 \
+  --topic payments \
+  --group payments-cg \
+  --from-beginning \
+  --consumer.config secrets/payments-consumer.properties
+# → TopicAuthorizationException
+
+# ✅ Produce to `payments` — allowed (Write ACL)
+kafka-console-producer \
+  --bootstrap-server localhost:9094 \
+  --topic payments \
+  --producer.config secrets/payments-consumer.properties
+```
+
+#### Avro (with Schema Registry)
+
+```bash
+# ✅ Consume Avro from `orders` with CORRECT group — allowed, output decoded as JSON
+kafka-avro-console-consumer \
+  --bootstrap-server localhost:9094 \
+  --topic orders \
+  --group payments-cg \
+  --from-beginning \
+  --property schema.registry.url=http://localhost:8081 \
+  --consumer.config secrets/payments-consumer.properties
+
+# ❌ Consume Avro from `orders` with WRONG group — denied
+kafka-avro-console-consumer \
+  --bootstrap-server localhost:9094 \
+  --topic orders \
+  --group wrong-group \
+  --from-beginning \
+  --property schema.registry.url=http://localhost:8081 \
+  --consumer.config secrets/payments-consumer.properties
 # → GroupAuthorizationException
 ```
 
-### Using `analytics-reader`
+---
+
+### Using `analytics-reader` (event consumer, group-locked)
+
+`analytics-reader` has `Read` on `orders-events` and `payments-events`, locked to group `analytics-cg`.
+
+#### Plain string
 
 ```bash
-kafka-console-consumer.sh \
+# ✅ Consume `orders-events` with CORRECT group — allowed
+kafka-console-consumer \
   --bootstrap-server localhost:9094 \
   --topic orders-events \
   --group analytics-cg \
   --from-beginning \
-  --consumer-property security.protocol=SASL_PLAINTEXT \
-  --consumer-property sasl.mechanism=PLAIN \
-  --consumer-property 'sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="analytics-reader" password="<analytics-reader-secret>";'
-```
+  --consumer.config secrets/analytics-reader.properties
 
-> `analytics-reader` has no password in `kafka_server_jaas.conf` yet — add `user_analytics-reader="<password>"` there first.
+# ❌ Consume `orders-events` with WRONG group — denied
+kafka-console-consumer \
+  --bootstrap-server localhost:9094 \
+  --topic orders-events \
+  --group wrong-group \
+  --from-beginning \
+  --consumer.config secrets/analytics-reader.properties
+# → GroupAuthorizationException
 
-### Using a properties file (cleaner alternative)
-
-Create a file e.g. `secrets/orders-producer.properties`:
-```properties
-security.protocol=SASL_PLAINTEXT
-sasl.mechanism=PLAIN
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="orders-producer" password="orders-prod-secret";
-```
-
-Then:
-```bash
-kafka-console-producer.sh \
+# ❌ Consume `orders` — denied (no Read ACL on orders for analytics-reader)
+kafka-console-consumer \
   --bootstrap-server localhost:9094 \
   --topic orders \
-  --producer.config secrets/orders-producer.properties
+  --group analytics-cg \
+  --from-beginning \
+  --consumer.config secrets/analytics-reader.properties
+# → TopicAuthorizationException
+```
+
+#### Avro (with Schema Registry)
+
+```bash
+# ✅ Consume Avro from `orders-events` with CORRECT group — allowed
+kafka-avro-console-consumer \
+  --bootstrap-server localhost:9094 \
+  --topic orders-events \
+  --group analytics-cg \
+  --from-beginning \
+  --property schema.registry.url=http://localhost:8081 \
+  --consumer.config secrets/analytics-reader.properties
+
+# ❌ Consume Avro from `payments-events` with WRONG group — denied
+kafka-avro-console-consumer \
+  --bootstrap-server localhost:9094 \
+  --topic payments-events \
+  --group wrong-group \
+  --from-beginning \
+  --property schema.registry.url=http://localhost:8081 \
+  --consumer.config secrets/analytics-reader.properties
+# → GroupAuthorizationException
 ```
 
 ---
@@ -578,4 +918,25 @@ kafka-consumer-groups.sh \
 ### Re-run topic/ACL init (without full restart)
 ```bash
 docker compose up topic-acl-init
+```
+
+### Re-run schema init (re-register all Avro schemas)
+```bash
+docker compose up schema-init
+```
+
+### Inspect Schema Registry from the host
+
+```bash
+# List all subjects
+curl http://localhost:8081/subjects
+
+# List versions of a subject
+curl http://localhost:8081/subjects/orders-value/versions
+
+# Fetch latest schema for a subject
+curl http://localhost:8081/subjects/orders-value/versions/latest
+
+# Check global compatibility mode
+curl http://localhost:8081/config
 ```
