@@ -1,0 +1,24 @@
+# Let's Encrypt Issuer using Azure DNS for DNS-01 challenge
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt-issuer
+  namespace: cert-manager
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops@example.com
+    privateKeySecretRef:
+      name: letsencrypt-private-key
+    solvers:
+      - dns01:
+          azureDNS:
+            clientID: "<your-azure-client-id>"
+            clientSecretSecretRef:
+              name: azure-sp-secret
+              key: AZURE_CLIENT_SECRET
+            resourceGroupName: "<your-rg>"
+            subscriptionID: "<your-subscription-id>"
+            tenantID: "<your-tenant-id>"
+            hostedZoneName: example.com
+            environment: AzurePublicCloud

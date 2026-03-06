@@ -1,0 +1,16 @@
+# cert-manager will request a TLS cert for these DNS names from Let's Encrypt
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: my-kafka-cluster-cert
+  namespace: cert-manager
+spec:
+  secretName: my-kafka-cluster-tls
+  issuerRef:
+    name: letsencrypt-issuer
+    kind: Issuer
+  dnsNames:
+    - my-kafka-cluster-bootstrap.example.com
+    - my-kafka-cluster-kafka-0.example.com
+    - my-kafka-cluster-kafka-1.example.com
+    - my-kafka-cluster-kafka-2.example.com

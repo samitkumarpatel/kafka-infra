@@ -1,0 +1,54 @@
+# Daily CronJob: reads TLS certs from K8s Secrets → pushes to HashiCorp Vault
+# The cert volumes are PATCHED per-cluster (each cluster has different certs)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: push-certs-to-vault
+  namespace: cert-manager
+spec:
+  schedule: "0 10 * * *"           # Every day at 10:00 UTC
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Replace
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          serviceAccountName: cert-manager-sa
+          imagePullSecrets:
+            - name: registry-pull-secret
+          securityContext:
+            runAsNonRoot: true
+            fsGroup: 65534
+          containers:
+            - name: cert-uploader
+              image: your-registry.example.com/cert-uploader:v1
+              imagePullPolicy: Always
+              resources:
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+              command:
+                - /scripts/push-certs.sh
+              env:
+                - name: VAULT_ADDR
+                  value: "https://vault.example.com"
+                - name: VAULT_ROLE_ID
+                  value: "<vault-approle-role-id>"
+                - name: VAULT_SECRET_ID
+                  value: "<vault-approle-secret-id>"
+                - name: CERTS_VAULT_PATH
+                  value: "secret/data/kubernetes/kafka-certs"
+              # volumeMounts are ADDED via cluster-level patches:
+              # - name: my-kafka-cluster-tls
+              #   mountPath: /certs/my-kafka-cluster
+              #   readOnly: true
+          restartPolicy: OnFailure
+          # volumes are ADDED via cluster-level patches:
+          # - name: my-kafka-cluster-tls
+          #   secret:
+          #     secretName: my-kafka-cluster-tls

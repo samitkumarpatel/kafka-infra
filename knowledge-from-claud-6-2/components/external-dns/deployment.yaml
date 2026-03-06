@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-dns
+  namespace: external-dns
+  annotations:
+    reloader.stakater.com/auto: "true"   # Auto-restart if azure-dns-secret changes
+spec:
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: external-dns
+  template:
+    metadata:
+      labels:
+        app: external-dns
+    spec:
+      serviceAccountName: external-dns
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65534
+      containers:
+        - name: external-dns
+          image: registry.k8s.io/external-dns/external-dns:v0.14.0
+          resources:
+            limits:
+              cpu: 200m
+              memory: 800Mi
+            requests:
+              cpu: 25m
+              memory: 50Mi
+          args:
+            - --log-level=info
+            - --log-format=json
+            - --domain-filter=example.com          # Your DNS zone
+            - --policy=sync
+            - --provider=azure
+            - --registry=txt
+            - --txt-prefix=_
+            - --source=service
+            - --source=ingress
+            - --interval=120m
+            # PATCH per cluster: --txt-owner-id=<cluster-name>
+            # PATCH per cluster: --namespace=<watched-namespace>
+          volumeMounts:
+            - name: azure-config-file
+              mountPath: /etc/kubernetes
+              readOnly: true
+      volumes:
+        - name: azure-config-file
+          secret:
+            secretName: azure-dns-secret
